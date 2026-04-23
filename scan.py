@@ -1,17 +1,31 @@
 import os
 import re
 import math
-import json
 import time
+import asyncio
 from datetime import datetime, timezone
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
 import httpx
-import psycopg
 from bs4 import BeautifulSoup
+from supabase import create_client, Client
 
-YOUTUBE_API_KEY = os.environ["YOUTUBE_API_KEY"]
-DATABASE_URL = os.environ["DATABASE_URL"]
+YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "").strip()
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
+
+missing = []
+if not YOUTUBE_API_KEY:
+    missing.append("YOUTUBE_API_KEY")
+if not SUPABASE_URL:
+    missing.append("SUPABASE_URL")
+if not SUPABASE_KEY:
+    missing.append("SUPABASE_KEY")
+
+if missing:
+    raise SystemExit(f"Missing required environment variables: {', '.join(missing)}")
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 YOUTUBE_BASE = "https://www.googleapis.com/youtube/v3"
 QUERIES = [
@@ -105,7 +119,10 @@ async def check_url(client: httpx.AsyncClient, url: str) -> dict:
         soup = BeautifulSoup(text, "html.parser")
         title = soup.title.string.strip() if soup.title and soup.title.string else ""
         lower = text.lower()
-        soft = any(s in lower for s in ["product not found", "page not found", "domain for sale", "buy this domain", "coming soon"])
+        soft = any(s in lower for s in [
+            "product not found", "page not found", "domain for sale",
+            "buy this domain", "coming soon"
+        ])
         return {
             "http_status": r.status_code,
             "final_url": str(r.url),
@@ -128,110 +145,148 @@ async def check_url(client: httpx.AsyncClient, url: str) -> dict:
             "page_title": None,
         }
 
-def upsert_video(cur, v: dict, query: str) -> int:
+def upsert_video(v: dict, query: str) -> dict:
     stats = v.get("statistics", {})
     snippet = v.get("snippet", {})
-    cur.execute("""
-        insert into videos (
-            video_id, channel_id, title, description, published_at, discovered_query,
-            view_count, comment_count, like_count, is_old, is_popular
-        ) values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        on conflict (video_id) do update set
-            channel_id = excluded.channel_id,
-            title = excluded.title,
-            description = excluded.description,
-            published_at = excluded.published_at,
-            discovered_query = excluded.discovered_query,
-            view_count = excluded.view_count,
-            comment_count = excluded.comment_count,
-            like_count = excluded.like_count,
-            is_old = excluded.is_old,
-            is_popular = excluded.is_popular
-        returning id
-    """, (
-        v["id"],
-        snippet.get("channelId"),
-        snippet.get("title"),
-        snippet.get("description", ""),
-        snippet.get("publishedAt"),
-        query,
-        int(stats.get("viewCount", 0)),
-        int(stats.get("commentCount", 0)),
-        int(stats.get("likeCount", 0)),
-        years_old(snippet["publishedAt"]) >= 2,
-        is_old_and_popular(int(stats.get("viewCount", 0)), int(stats.get("commentCount", 0)), snippet["publishedAt"])
-    ))
-    return cur.fetchone()[0]
 
-def upsert_link(cur, video_pk: int, original_url: str, normalized_url: str) -> int:
-    cur.execute("""
-        insert into links (video_id, source_type, original_url, normalized_url)
-        values (%s, 'description', %s, %s)
-        on conflict (video_id, normalized_url, source_type) do update set
-            original_url = excluded.original_url
-        returning id
-    """, (video_pk, original_url, normalized_url))
-    return cur.fetchone()[0]
+    payload = {
+        "video_id": v["id"],
+        "channel_id": snippet.get("channelId"),
+        "title": snippet.get("title"),
+        "description": snippet.get("description", ""),
+        "published_at": snippet.get("publishedAt"),
+        "discovered_query": query,
+        "view_count": int(stats.get("viewCount", 0)),
+        "comment_count": int(stats.get("commentCount", 0)),
+        "like_count": int(stats.get("likeCount", 0)),
+        "is_old": years_old(snippet["publishedAt"]) >= 2,
+        "is_popular": is_old_and_popular(
+            int(stats.get("viewCount", 0)),
+            int(stats.get("commentCount", 0)),
+            snippet["publishedAt"]
+        ),
+    }
 
-def insert_check(cur, link_id: int, result: dict) -> int:
-    cur.execute("""
-        insert into link_checks (
-            link_id, http_status, final_url, response_time_ms, is_broken, is_soft_broken,
-            broken_type, redirect_chain, page_title
-        ) values (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        returning id
-    """, (
-        link_id,
-        result["http_status"],
-        result["final_url"],
-        result["response_time_ms"],
-        result["is_broken"],
-        result["is_soft_broken"],
-        result["broken_type"],
-        json.dumps(result["redirect_chain"]),
-        result["page_title"],
-    ))
-    return cur.fetchone()[0]
+    result = (
+        supabase
+        .table("videos")
+        .upsert(payload, on_conflict="video_id")
+        .execute()
+    )
 
-def upsert_opportunity(cur, video_pk: int, link_id: int, check_id: int, score_value: float, niche: str):
-    cur.execute("""
-        insert into opportunities (video_id, link_id, latest_check_id, opportunity_score, niche)
-        values (%s,%s,%s,%s,%s)
-        on conflict do nothing
-    """, (video_pk, link_id, check_id, score_value, niche))
+    # fetch id if response doesn't include it consistently
+    row = (
+        supabase
+        .table("videos")
+        .select("id,video_id")
+        .eq("video_id", v["id"])
+        .limit(1)
+        .execute()
+    )
+
+    return row.data[0]
+
+def upsert_link(video_pk: int, original_url: str, normalized_url: str) -> dict:
+    payload = {
+        "video_id": video_pk,
+        "source_type": "description",
+        "original_url": original_url,
+        "normalized_url": normalized_url,
+    }
+
+    (
+        supabase
+        .table("links")
+        .upsert(payload, on_conflict="video_id,normalized_url,source_type")
+        .execute()
+    )
+
+    row = (
+        supabase
+        .table("links")
+        .select("id,video_id,normalized_url")
+        .eq("video_id", video_pk)
+        .eq("normalized_url", normalized_url)
+        .eq("source_type", "description")
+        .limit(1)
+        .execute()
+    )
+
+    return row.data[0]
+
+def insert_check(link_id: int, result: dict) -> dict:
+    payload = {
+        "link_id": link_id,
+        "http_status": result["http_status"],
+        "final_url": result["final_url"],
+        "response_time_ms": result["response_time_ms"],
+        "is_broken": result["is_broken"],
+        "is_soft_broken": result["is_soft_broken"],
+        "broken_type": result["broken_type"],
+        "redirect_chain": result["redirect_chain"],
+        "page_title": result["page_title"],
+    }
+
+    created = (
+        supabase
+        .table("link_checks")
+        .insert(payload)
+        .execute()
+    )
+
+    return created.data[0]
+
+def upsert_opportunity(video_pk: int, link_id: int, check_id: int, score_value: float, niche: str):
+    payload = {
+        "video_id": video_pk,
+        "link_id": link_id,
+        "latest_check_id": check_id,
+        "opportunity_score": score_value,
+        "niche": niche,
+        "status": "new",
+    }
+
+    # this assumes you add a unique constraint shown below
+    (
+        supabase
+        .table("opportunities")
+        .upsert(payload, on_conflict="video_id,link_id")
+        .execute()
+    )
 
 async def main():
-    async with httpx.AsyncClient() as client, psycopg.connect(DATABASE_URL) as conn:
-        with conn.cursor() as cur:
-            for query in QUERIES:
-                ids = await youtube_search(client, query)
-                videos = await youtube_videos(client, ids)
+    async with httpx.AsyncClient() as client:
+        for query in QUERIES:
+            ids = await youtube_search(client, query)
+            videos = await youtube_videos(client, ids)
 
-                for v in videos:
-                    stats = v.get("statistics", {})
-                    snippet = v.get("snippet", {})
-                    views = int(stats.get("viewCount", 0))
-                    comments = int(stats.get("commentCount", 0))
-                    published_at = snippet["publishedAt"]
+            for v in videos:
+                stats = v.get("statistics", {})
+                snippet = v.get("snippet", {})
+                views = int(stats.get("viewCount", 0))
+                comments = int(stats.get("commentCount", 0))
+                published_at = snippet["publishedAt"]
 
-                    if not is_old_and_popular(views, comments, published_at):
-                        continue
+                if not is_old_and_popular(views, comments, published_at):
+                    continue
 
-                    video_pk = upsert_video(cur, v, query)
-                    urls = extract_urls(snippet.get("description", ""))
+                video_row = upsert_video(v, query)
+                video_pk = video_row["id"]
 
-                    for url in urls:
-                        normalized = normalize_url(url)
-                        link_id = upsert_link(cur, video_pk, url, normalized)
-                        result = await check_url(client, normalized)
+                urls = extract_urls(snippet.get("description", ""))
 
-                        if result["is_broken"] or result["is_soft_broken"]:
-                            check_id = insert_check(cur, link_id, result)
-                            opp_score = score(views, comments, years_old(published_at), 1.0)
-                            upsert_opportunity(cur, video_pk, link_id, check_id, opp_score, query)
+                for url in urls:
+                    normalized = normalize_url(url)
+                    link_row = upsert_link(video_pk, url, normalized)
+                    link_id = link_row["id"]
 
-            conn.commit()
+                    result = await check_url(client, normalized)
+
+                    if result["is_broken"] or result["is_soft_broken"]:
+                        check_row = insert_check(link_id, result)
+                        check_id = check_row["id"]
+                        opp_score = score(views, comments, years_old(published_at), 1.0)
+                        upsert_opportunity(video_pk, link_id, check_id, opp_score, query)
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
