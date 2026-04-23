@@ -1,4 +1,4 @@
-name: yt-blink-scan
+name: youtube-broken-link-scan
 
 on:
   workflow_dispatch:
@@ -21,8 +21,20 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Check required secrets exist
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          [ -n "$YOUTUBE_API_KEY" ] || (echo "Missing YOUTUBE_API_KEY" && exit 1)
+          [ -n "$SUPABASE_URL" ] || (echo "Missing SUPABASE_URL" && exit 1)
+          [ -n "$SUPABASE_KEY" ] || (echo "Missing SUPABASE_KEY" && exit 1)
+          echo "Secrets are present"
+
       - name: Run scan
         env:
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: python scan.py
